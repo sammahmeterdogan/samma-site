@@ -1,0 +1,161 @@
+import sys
+import os
+import yaml
+import time
+import logging
+from pathlib import Path
+from collections import Counter
+
+import cv2
+import torch
+from ultralytics import YOLO
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+# ---------- PATH SETTINGS ---------------------------------------------------
+# Betiğin bulunduğu dizini dinamik olarak al
+ROOT_DIR      = Path(__file__).parent
+DATA_YAML     = ROOT_DIR / "data.yaml"  # data.yaml aynı dizinde
+MODEL_PATH    = ROOT_DIR / "yolo_fruit_detector.pt"  # Model dosyasını güncelleyebilirsiniz (örn. yolov85.pt)
+SPLITS        = ("train", "valid", "test")
+IMG_EXT       = {".jpg", ".jpeg", ".png"}
+CAMERA_INDEX  = 0  # macOS için varsayılan kamera indeksi
+# ---------------------------------------------------------------------------
+
+def sanity_check() -> None:
+    """
+    Veri setinin tutarlılığını kontrol eder ve önbellek dosyalarını temizler.
+    Eksik veya boş etiket bulunursa çıkar.
+    """
+    ok = True
+    for split in SPLITS:
+        img_dir = ROOT_DIR / split / "images"
+        lbl_dir = ROOT_DIR / split / "labels"
+
+        if not img_dir.exists() or not lbl_dir.exists():
+            logging.error("❌ %s altında görüntüler veya etiketler klasörü eksik!", split)
+            sys.exit(1)
+
+        imgs  = [p for p in img_dir.rglob("*") if p.suffix.lower() in IMG_EXT]
+        miss  = 0
+        empty = 0
+        for p in imgs:
+            rel   = p.relative_to(img_dir).with_suffix(".txt")
+            lbl_p = lbl_dir / rel
+            if not lbl_p.exists():
+                miss += 1
+            elif lbl_p.stat().st_size == 0:
+                empty += 1
+
+        logging.info("%s → %d görüntü | %d eksik etiket | %d boş etiket",
+                     split, len(imgs), miss, empty)
+        if miss or empty:
+            ok = False
+
+    # Önbellek dosyalarını temizle
+    for c in ROOT_DIR.rglob("*.cache"):
+        c.unlink(missing_ok=True)
+
+    if not ok:
+        logging.error("Eksik/boş etiketler tespit edildi → önce veri setini düzeltin!")
+        sys.exit(1)
+
+# ---------------------------------------------------------------------------
+def train_or_load() -> YOLO:
+    """
+    Önceden eğitilmiş bir model varsa yükler; yoksa yeni bir tane eğitir.
+    """
+    if MODEL_PATH.exists():
+        logging.info("✅ Eğitilmiş model bulundu (%s), yükleniyor…", MODEL_PATH.name)
+        return YOLO(str(MODEL_PATH))
+
+    logging.info("🔄 Model bulunamadı, eğitim başlatılıyor…")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model  = YOLO("yolov8s.pt")  # YOLO12 kullanıyorsanız "yolo12s.pt" olarak güncelleyin
+
+    model.train(
+        data=str(DATA_YAML),
+        epochs=250,  # Gerekirse ayarlayın
+        imgsz=640,
+        batch=16,
+        workers=8,
+        device=device,
+        half=True,
+        name="fruit_detector",
+    )
+    model.save(str(MODEL_PATH))
+    logging.info("Model eğitildi ve kaydedildi → %s", MODEL_PATH.name)
+    return model
+
+# ---------------------------------------------------------------------------
+def realtime_detection(model: YOLO, camera_index: int = CAMERA_INDEX) -> None:
+    """
+    macOS varsayılan kamerasını açar ve gerçek zamanlı meyve tespiti yapar.
+    """
+    # YAML'dan sınıf isimlerini oku
+    with open(DATA_YAML, "r", encoding="utf-8") as f:
+        classes = yaml.safe_load(f)["names"]
+
+    # macOS için varsayılan OpenCV arka ucunu kullan
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        logging.error("⚠️ Kamera açılamadı! (indeks=%d)", camera_index)
+        return
+
+    prev = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame_r = cv2.resize(frame, (640, 640))
+        results = model(frame_r, conf=0.25, iou=0.45, device="cuda" if torch.cuda.is_available() else "cpu")
+        detected = []
+
+        for r in results:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf[0])
+                cls  = int(b.cls[0])
+
+                if cls < len(classes):
+                    label = f"{classes[cls]}: {conf:.2f}"
+                    detected.append(classes[cls])
+
+                    # Orijinal çözünürlüğe geri ölçeklendir
+                    h, w = frame.shape[:2]
+                    x1 = int(x1 * w / 640); y1 = int(y1 * h / 640)
+                    x2 = int(x2 * w / 640); y2 = int(y2 * h / 640)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Sayacı göster
+        for i, (fruit, cnt) in enumerate(Counter(detected).items()):
+            cv2.putText(frame, f"{fruit}: {cnt}", (10, 60 + i*30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        # FPS hesapla
+        now = time.time()
+        fps = 1 / (now - prev + 1e-6)
+        prev = now
+        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        cv2.imshow("Gerçek Zamanlı Meyve Tespiti (çıkmak için q tuşuna basın)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ---------------------------------------------------------------------------
+def main() -> None:
+    sanity_check()             # 1) Veri seti tutarlılığını kontrol et
+    model = train_or_load()    # 2) Modeli yükle veya eğit
+    realtime_detection(model)  # 3) Gerçek zamanlı tespiti başlat
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
