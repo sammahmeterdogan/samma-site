@@ -1,0 +1,174 @@
+import sys
+import os
+import yaml
+import time
+import logging
+import shutil
+from pathlib import Path
+from collections import Counter
+
+import cv2
+import torch
+from ultralytics import YOLO
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+print("Jetson Orin Nano'da maksimum performans için lütfen aşağıdaki komutları çalıştırın:")
+print("sudo nvpmodel -m 0")
+print("sudo jetson_clocks")
+print("Ayrıca, jetson-stats kurun: sudo apt update; sudo pip install jetson-stats; sudo reboot")
+print("Performansı izlemek için 'jtop' komutunu kullanabilirsiniz.")
+print("Ultralytics paketini kurmak için: https://docs.ultralytics.com/guides/nvidia-jetson/ adresindeki adımları izleyin.")
+
+# ---------- YOL AYARLARI ---------------------------------------------------
+ROOT_DIR      = Path(r"/home/user/Fruits-detection")  # Jetson'da uygun bir yol
+DATA_YAML     = ROOT_DIR / "data.yaml"
+MODEL_PATH    = ROOT_DIR / "yolo_fruit_detector.pt"
+ENGINE_PATH   = ROOT_DIR / "yolo_fruit_detector.engine"
+SPLITS        = ("train", "valid", "test")
+IMG_EXT       = {".jpg", ".jpeg", ".png"}
+CAMERA_INDEX  = 0  # Jetson'da genellikle 0, CSI kamera için uygun indeksi kontrol edin
+# ---------------------------------------------------------------------------
+
+def sanity_check() -> None:
+    """
+    *images/labels* eşleşmesini denetler, .cache dosyalarını temizler.
+    Eksik veya BOŞ etiket varsa programı sonlandırır.
+    """
+    ok = True
+    for split in SPLITS:
+        img_dir = ROOT_DIR / split / "images"
+        lbl_dir = ROOT_DIR / split / "labels"
+
+        if not img_dir.exists() or not lbl_dir.exists():
+            logging.error("❌ %s altında images / labels klasörü eksik!", split)
+            sys.exit(1)
+
+        imgs  = [p for p in img_dir.rglob("*") if p.suffix.lower() in IMG_EXT]
+        miss  = 0
+        empty = 0
+        for p in imgs:
+            rel   = p.relative_to(img_dir).with_suffix(".txt")
+            lbl_p = lbl_dir / rel
+            if not lbl_p.exists():
+                miss += 1
+            elif lbl_p.stat().st_size == 0:
+                empty += 1
+
+        logging.info("%s → %d görüntü | %d eksik etiket | %d boş etiket",
+                     split, len(imgs), miss, empty)
+        if miss or empty:
+            ok = False
+
+    for c in ROOT_DIR.rglob("*.cache"):
+        c.unlink(missing_ok=True)
+
+    if not ok:
+        logging.error("Eksik/boş etiketler var → önce veri kümesini düzeltin!")
+        sys.exit(1)
+
+def train_or_load() -> YOLO:
+    """
+    Eğitilmiş model varsa yükler, yoksa eğitir ve TensorRT motoruna dönüştürür.
+    """
+    if ENGINE_PATH.exists():
+        logging.info("✅ TensorRT motor modeli bulundu (%s), yükleniyor…", ENGINE_PATH.name)
+        return YOLO(str(ENGINE_PATH))
+
+    elif MODEL_PATH.exists():
+        logging.info("✅ PyTorch modeli bulundu (%s), yükleniyor…", MODEL_PATH.name)
+        model = YOLO(str(MODEL_PATH))
+        if torch.cuda.is_available():
+            logging.info("TensorRT motor formatına dönüştürülüyor…")
+            model.export(format="engine", half=True)
+            logging.info("TensorRT motor modeli yüklendi (%s)", ENGINE_PATH.name)
+            return YOLO(str(ENGINE_PATH))
+        return model
+
+    logging.info("🔄 Model bulunamadı, eğitim başlatılıyor…")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = YOLO("yolo12s")  # YOLOv12s modelini otomatik indirir
+
+    model.train(
+        data=str(DATA_YAML),
+        epochs=250,
+        imgsz=640,
+        batch=16,
+        workers=8,
+        device=device,
+        half=True,
+        name="fruit_detector",
+    )
+    model.save(str(MODEL_PATH))
+    if torch.cuda.is_available():
+        logging.info("Eğitilmiş model TensorRT motor formatına dönüştürülüyor…")
+        model.export(format="engine", half=True)
+        logging.info("TensorRT motor modeli yüklendi (%s)", ENGINE_PATH.name)
+        return YOLO(str(ENGINE_PATH))
+    logging.info("Model eğitildi ve kaydedildi → %s", MODEL_PATH.name)
+    return model
+
+def realtime_detection(model: YOLO, camera_index: int = CAMERA_INDEX) -> None:
+    """
+    Kamerayı açar ve gerçek-zamanlı meyve tespiti yapar.
+    """
+    with open(DATA_YAML, "r", encoding="utf-8") as f:
+        classes = yaml.safe_load(f)["names"]
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        logging.error("⚠️ Kamera açılamadı! (index=%d)", camera_index)
+        return
+
+    prev = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame_r = cv2.resize(frame, (640, 640))
+        results = model(frame_r, conf=0.25, iou=0.45)
+        detected = []
+
+        for r in results:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf[0])
+                cls = int(b.cls[0])
+
+                if cls < len(classes):
+                    label = f"{classes[cls]}: {conf:.2f}"
+                    detected.append(classes[cls])
+
+                    h, w = frame.shape[:2]
+                    x1 = int(x1 * w / 640); y1 = int(y1 * h / 640)
+                    x2 = int(x2 * w / 640); y2 = int(y2 * h / 640)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        for i, (fruit, cnt) in enumerate(Counter(detected).items()):
+            cv2.putText(frame, f"{fruit}: {cnt}", (10, 60 + i*30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        now = time.time()
+        fps = 1 / (now - prev + 1e-6)
+        prev = now
+        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        cv2.imshow("Real-Time Fruit Detection (press q to quit)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def main() -> None:
+    sanity_check()
+    model = train_or_load()
+    realtime_detection(model)
+
+if __name__ == "__main__":
+    main()
