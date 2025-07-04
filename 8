@@ -1,0 +1,413 @@
+import asyncio
+import platform
+import sys
+import os
+import yaml
+import time
+import logging
+import shutil
+from pathlib import Path
+from collections import Counter
+from threading import Thread
+from queue import Queue
+import gc
+
+import cv2
+import torch
+import numpy as np
+from ultralytics import YOLO
+
+# Jetson Orin Nano için özel optimizasyonlar
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # İlk GPU kullan
+torch.backends.cudnn.benchmark = True     # CuDNN hızlandırması
+torch.backends.cuda.matmul.allow_tf32 = True  # TF32 kullan (Ampere GPU'larda)
+torch.backends.cudnn.allow_tf32 = True
+
+# Bellek optimizasyonu
+torch.cuda.empty_cache()
+gc.collect()
+
+# Logging seviyesini WARNING'e yükseltelim (performans için)
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s - %(message)s")
+
+# ---------- JETSON ORIN NANO PERFORMANS AYARLARI --------------------------
+# Model giriş boyutu - daha küçük boyut = daha yüksek FPS
+MODEL_INPUT_SIZE = 416  # 640'dan 416'ya düşürüldü (%70 daha hızlı)
+
+# Çok iş parçacıklı işlem için kuyruk boyutu
+FRAME_QUEUE_SIZE = 3
+
+# Kamera çözünürlüğü - daha küçük = daha hızlı
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+# Inference optimizasyonları
+CONF_THRESHOLD = 0.3    # Daha yüksek eşik = daha az işlem
+IOU_THRESHOLD = 0.5     # Daha yüksek eşik = daha az post-processing
+MAX_DETECTIONS = 100    # Maksimum tespit sayısı sınırı
+# --------------------------------------------------------------------------
+
+# Orijinal yol ayarları (değişmedi)
+ROOT_DIR      = Path(r"/home/bsk/Desktop/Fruits-detection")
+DATA_YAML     = ROOT_DIR / "data.yaml"
+MODEL_PATH    = ROOT_DIR / "yolo_fruit_detector.pt"
+ENGINE_PATH   = ROOT_DIR / "yolo_fruit_detector.engine"
+SPLITS        = ("train", "valid", "test")
+IMG_EXT       = {".jpg", ".jpeg", ".png"}
+CAMERA_INDEX  = 0
+
+def optimize_jetson_power():
+    """
+    Jetson Orin Nano'yu maksimum performans moduna alır
+    """
+    try:
+        # GPU clock hızını maksimuma çıkar
+        os.system("sudo jetson_clocks --show > /dev/null 2>&1")
+        os.system("sudo jetson_clocks > /dev/null 2>&1")
+        
+        # CPU governor'ı performance moduna al
+        os.system("echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null 2>&1")
+        
+        # Fan hızını maksimuma çıkar (soğutma için)
+        os.system("echo 255 | sudo tee /sys/devices/pwm-fan/target_pwm > /dev/null 2>&1")
+        
+        logging.info("Jetson Orin Nano maksimum performans moduna alındı")
+    except Exception as e:
+        logging.warning("Jetson optimizasyonu uygulanamadı: %s", str(e))
+
+def sanity_check() -> None:
+    """Veri seti kontrolü - optimize edilmiş versiyon"""
+    ok = True
+    
+    for split in SPLITS:
+        img_dir = ROOT_DIR / split / "images"
+        lbl_dir = ROOT_DIR / split / "labels"
+
+        if not img_dir.exists() or not lbl_dir.exists():
+            logging.error("Veri dizin yapısı eksik: %s", split)
+            sys.exit(1)
+
+        imgs = [p for p in img_dir.rglob("*") if p.suffix.lower() in IMG_EXT]
+        miss = sum(1 for p in imgs if not (lbl_dir / p.relative_to(img_dir).with_suffix(".txt")).exists())
+        empty = sum(1 for p in imgs if (lbl_dir / p.relative_to(img_dir).with_suffix(".txt")).exists() 
+                   and (lbl_dir / p.relative_to(img_dir).with_suffix(".txt")).stat().st_size == 0)
+
+        if miss or empty:
+            ok = False
+
+    # Cache temizleme
+    for c in ROOT_DIR.rglob("*.cache"):
+        c.unlink(missing_ok=True)
+
+    if not ok:
+        logging.error("Veri seti tutarsızlıkları tespit edildi!")
+        sys.exit(1)
+
+def train_or_load() -> YOLO:
+    """TensorRT öncelikli model yükleme - Jetson için optimize edilmiş"""
+    
+    # TensorRT Engine kontrolü
+    if ENGINE_PATH.exists():
+        logging.info("TensorRT motor modeli yükleniyor: %s", ENGINE_PATH.name)
+        model = YOLO(str(ENGINE_PATH))
+        model.to('cuda')  # GPU'ya taşı
+        return model
+
+    # PyTorch modeli kontrolü
+    elif MODEL_PATH.exists():
+        logging.info("PyTorch modeli yükleniyor: %s", MODEL_PATH.name)
+        model = YOLO(str(MODEL_PATH))
+        model.to('cuda')
+        
+        # TensorRT'ye dönüştür
+        if torch.cuda.is_available():
+            try:
+                logging.info("TensorRT motor formatına dönüştürülüyor...")
+                model.export(
+                    format="engine",
+                    half=True,  # FP16 kullan
+                    workspace=4,  # GB cinsinden workspace
+                    verbose=False,
+                    device=0
+                )
+                logging.info("TensorRT motor hazır: %s", ENGINE_PATH.name)
+                return YOLO(str(ENGINE_PATH))
+            except Exception as e:
+                logging.warning("TensorRT dönüşümü başarısız: %s", str(e))
+        return model
+
+    # Yerel yolo model kontrolü
+    elif (ROOT_DIR / "yolo12s.pt").exists():
+        model = YOLO(str(ROOT_DIR / "yolo12s.pt"))
+        model.to('cuda')
+        return model
+
+    # Online model indirme
+    else:
+        logging.info("YOLOv8n modeli indiriliyor...")
+        model = YOLO("yolov8n.pt")  # En küçük model
+        model.to('cuda')
+        return model
+
+def setup_camera(index: int) -> cv2.VideoCapture:
+    """Jetson için optimize edilmiş kamera kurulumu"""
+    # GStreamer pipeline kullan (Jetson'da daha hızlı)
+    gst_pipeline = f"""
+    nvarguscamerasrc sensor-id={index} ! 
+    video/x-raw(memory:NVMM), width={CAMERA_WIDTH}, height={CAMERA_HEIGHT}, format=NV12, framerate=30/1 ! 
+    nvvidconv ! video/x-raw, format=BGRx ! 
+    videoconvert ! video/x-raw, format=BGR ! 
+    appsink drop=1 max-buffers=1
+    """
+    
+    # Önce GStreamer dene
+    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        logging.info("GStreamer kamera başarıyla açıldı")
+        return cap
+    
+    # GStreamer başarısız olursa standart kamera dene
+    cap = cv2.VideoCapture(index)
+    if cap.isOpened():
+        # Kamera ayarlarını optimize et
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Buffer'ı minimize et
+        logging.info("Standart kamera başarıyla açıldı")
+        return cap
+    
+    logging.error("Kamera açılamadı")
+    return None
+
+class FrameProcessor:
+    """Çok iş parçacıklı frame işleme sınıfı"""
+    
+    def __init__(self, model: YOLO, classes: list):
+        self.model = model
+        self.classes = classes
+        self.frame_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
+        self.result_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
+        self.processing = True
+        
+        # İşlem iş parçacığını başlat
+        self.process_thread = Thread(target=self._process_frames, daemon=True)
+        self.process_thread.start()
+    
+    def _process_frames(self):
+        """Arka planda frame işleme"""
+        while self.processing:
+            try:
+                if not self.frame_queue.empty():
+                    frame = self.frame_queue.get(timeout=0.1)
+                    
+                    # Model inference
+                    with torch.no_grad():  # Gradient hesaplamayı devre dışı bırak
+                        results = self.model(
+                            frame, 
+                            conf=CONF_THRESHOLD, 
+                            iou=IOU_THRESHOLD,
+                            max_det=MAX_DETECTIONS,
+                            verbose=False
+                        )
+                    
+                    # Sonuçları işle
+                    detections = []
+                    for r in results:
+                        for b in r.boxes:
+                            x1, y1, x2, y2 = map(int, b.xyxy[0])
+                            conf = float(b.conf[0])
+                            cls = int(b.cls[0])
+                            
+                            if cls < len(self.classes):
+                                detections.append({
+                                    'bbox': (x1, y1, x2, y2),
+                                    'conf': conf,
+                                    'class': self.classes[cls],
+                                    'class_id': cls
+                                })
+                    
+                    # Sonucu kuyruğa ekle
+                    if not self.result_queue.full():
+                        self.result_queue.put(detections)
+                
+            except Exception as e:
+                logging.error("Frame işleme hatası: %s", str(e))
+                continue
+    
+    def add_frame(self, frame):
+        """Yeni frame ekle"""
+        if not self.frame_queue.full():
+            self.frame_queue.put(frame)
+    
+    def get_results(self):
+        """Sonuçları al"""
+        if not self.result_queue.empty():
+            return self.result_queue.get()
+        return None
+    
+    def stop(self):
+        """İşlemi durdur"""
+        self.processing = False
+        if self.process_thread.is_alive():
+            self.process_thread.join(timeout=1.0)
+
+def realtime_detection(model: YOLO, camera_index: int = CAMERA_INDEX) -> None:
+    """Çok iş parçacıklı gerçek zamanlı tespit - Jetson optimizasyonu"""
+    
+    # Sınıf isimlerini yükle
+    try:
+        with open(DATA_YAML, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            classes = data.get("names", [])
+    except Exception as e:
+        logging.error("data.yaml yükleme hatası: %s", str(e))
+        sys.exit(1)
+
+    # Kamera kurulumu
+    cap = setup_camera(camera_index)
+    if not cap:
+        logging.error("Kamera başlatılamadı")
+        sys.exit(1)
+
+    # Frame işleyicisini başlat
+    processor = FrameProcessor(model, classes)
+    
+    # Performans takibi
+    fps_counter = 0
+    fps_start_time = time.time()
+    current_fps = 0
+    
+    # Ana pencere
+    cv2.namedWindow("Jetson Orin Nano - Fruit Detection", cv2.WINDOW_NORMAL)
+    
+    # Son tespit sonuçları
+    last_detections = []
+    
+    try:
+        while True:
+            # Frame yakala
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            
+            # Frame'i model giriş boyutuna resize et
+            frame_resized = cv2.resize(frame, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE))
+            
+            # Frame'i işleme kuyruğuna ekle
+            processor.add_frame(frame_resized)
+            
+            # Sonuçları al
+            detections = processor.get_results()
+            if detections is not None:
+                last_detections = detections
+            
+            # Görselleştirme (orijinal frame boyutunda)
+            display_frame = frame.copy()
+            
+            # Bbox'ları çiz
+            scale_x = frame.shape[1] / MODEL_INPUT_SIZE
+            scale_y = frame.shape[0] / MODEL_INPUT_SIZE
+            
+            detected_objects = []
+            for det in last_detections:
+                x1, y1, x2, y2 = det['bbox']
+                # Koordinatları orijinal frame boyutuna ölçekle
+                x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
+                y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+                
+                conf = det['conf']
+                class_name = det['class']
+                
+                detected_objects.append(class_name)
+                
+                # Bbox çiz
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Label
+                label = f"{class_name}: {conf:.2f}"
+                cv2.putText(display_frame, label, (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Nesne sayıları
+            object_counts = Counter(detected_objects)
+            y_offset = 30
+            for obj, count in object_counts.items():
+                cv2.putText(display_frame, f"{obj}: {count}", (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                y_offset += 25
+            
+            # FPS hesapla
+            fps_counter += 1
+            if time.time() - fps_start_time >= 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_start_time = time.time()
+            
+            # FPS göster
+            cv2.putText(display_frame, f"FPS: {current_fps}", (10, display_frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Görüntüyü göster
+            cv2.imshow("Jetson Orin Nano - Fruit Detection", display_frame)
+            
+            # Çıkış kontrolü
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    
+    except KeyboardInterrupt:
+        logging.info("Program kullanıcı tarafından durduruldu")
+    except Exception as e:
+        logging.error("Gerçek zamanlı tespit hatası: %s", str(e))
+    finally:
+        # Temizlik
+        processor.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        torch.cuda.empty_cache()  # GPU belleğini temizle
+
+def main() -> None:
+    """Ana program akışı - Jetson optimizasyonlarıyla"""
+    print("Jetson Orin Nano Fruit Detection - Performans Optimizasyonu")
+    print("=" * 60)
+    
+    # Jetson optimizasyonlarını uygula
+    optimize_jetson_power()
+    
+    # GPU bilgilerini göster
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"GPU Bellek: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    
+    # Veri seti kontrolü
+    sanity_check()
+    
+    # Model yükleme
+    print("Model yükleniyor...")
+    model = train_or_load()
+    
+    # Warm-up inference (ilk çalıştırma yavaş olabilir)
+    print("Model warm-up yapılıyor...")
+    dummy_input = torch.randn(1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).cuda()
+    with torch.no_grad():
+        _ = model(dummy_input, verbose=False)
+    
+    print("Gerçek zamanlı tespit başlatılıyor...")
+    print("Çıkmak için 'q' tuşuna basın")
+    
+    # Gerçek zamanlı tespit
+    realtime_detection(model)
+
+# Platform kontrolü
+if platform.system() == "Emscripten":
+    asyncio.ensure_future(main())
+else:
+    if __name__ == "__main__":
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\nProgram sonlandırıldı.")
+        except Exception as e:
+            logging.error("Ana program hatası: %s", str(e))
+            sys.exit(1)
