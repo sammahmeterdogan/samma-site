@@ -1,0 +1,166 @@
+# ------------------------------------------------------------
+# Real-Time Fruit Detection with Ultralytics-YOLOv12
+# NVIDIA Jetson Orin Nano için Optimize Edilmiş Sürüm
+# ------------------------------------------------------------
+import sys
+import os
+import yaml
+import time
+import logging
+from pathlib import Path
+from collections import Counter
+import cv2
+import torch
+from ultralytics import YOLO
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+# ---------- YOL AYARLARI (İSTEĞİNİZ ÜZERİNE DEĞİŞTİRİLMEDİ) -------------------
+# !!! DİKKAT: Bu kodu Jetson'da çalıştırırken bu Windows yollarını
+# Jetson'daki (Linux) dosya yapınıza göre GÜNCELLEMENİZ GEREKİR.
+# Örnek: ROOT_DIR = Path("/home/jetson/Desktop/Fruits-detection")
+ROOT_DIR      = Path(r"C:\Users\ASUS\Desktop\Fruits-detection")
+DATA_YAML     = ROOT_DIR / "data.yaml"
+# Model adını yolo12s olarak güncelledik
+MODEL_PATH_ENGINE = ROOT_DIR / "yolo12s_fruit_detector.engine"
+SPLITS        = ("train", "valid", "test")
+IMG_EXT       = {".jpg", ".jpeg", ".png"}
+CAMERA_INDEX  = 1
+# ---------------------------------------------------------------------------
+
+def sanity_check() -> None:
+    """
+    *images/labels* eşleşmesini denetler, .cache dosyalarını temizler.
+    Eksik veya BOŞ etiket varsa programı sonlandırır.
+    """
+    ok = True
+    for split in SPLITS:
+        img_dir = ROOT_DIR / split / "images"
+        lbl_dir = ROOT_DIR / split / "labels"
+        if not img_dir.exists() or not lbl_dir.exists():
+            logging.error("❌ %s altında images / labels klasörü eksik!", split)
+            sys.exit(1)
+        imgs  = [p for p in img_dir.rglob("*") if p.suffix.lower() in IMG_EXT]
+        miss, empty = 0, 0
+        for p in imgs:
+            rel   = p.relative_to(img_dir).with_suffix(".txt")
+            lbl_p = lbl_dir / rel
+            if not lbl_p.exists():
+                miss += 1
+            elif lbl_p.stat().st_size == 0:
+                empty += 1
+        logging.info("%s → %d görüntü | %d eksik etiket | %d boş etiket",
+                     split, len(imgs), miss, empty)
+        if miss or empty:
+            ok = False
+
+    for c in ROOT_DIR.rglob("*.cache"):
+        c.unlink(missing_ok=True)
+        
+    if not ok:
+        logging.error("Eksik/boş etiketler var → önce veri kümesini düzeltin!")
+        sys.exit(1)
+
+# ---------------------------------------------------------------------------
+def load_and_optimize_yolo12() -> YOLO:
+    """
+    Önce optimize edilmiş YOLOv12 TensorRT (.engine) modelini arar.
+    Bulamazsa, önceden eğitilmiş YOLOv12s (.pt) modelini indirir
+    ve onu Jetson için maksimum FPS sağlayacak TensorRT formatına dönüştürür.
+    """
+    # 1. Adım: Optimize edilmiş TensorRT modelini kontrol et
+    if MODEL_PATH_ENGINE.exists():
+        logging.info("✅ Optimize Edilmiş TensorRT modeli bulundu (%s), yükleniyor...", MODEL_PATH_ENGINE.name)
+        return YOLO(str(MODEL_PATH_ENGINE))
+
+    # 2. Adım: YOLOv12s modelini yükle ve TensorRT'ye dönüştür
+    logging.info("TensorRT modeli bulunamadı. YOLOv12s modeli yüklenip TensorRT formatına dönüştürülecek.")
+    logging.info("Bu işlem birkaç dakika sürebilir, lütfen bekleyin...")
+    
+    # Ultralytics kütüphanesi 'yolo12s.pt' modelini otomatik olarak indirecektir.
+    model_to_export = YOLO("yolo12s.pt")
+    
+    # Modeli Jetson'da maksimum performans için TensorRT'ye çeviriyoruz.
+    # 'device=0' Jetson'un GPU'sunu kullanır.
+    # 'half=True' FP16 hassasiyeti ile hızı artırır.
+    model_to_export.export(
+        format="engine",
+        half=True,
+        imgsz=640,
+        device=0,
+        workspace=4 # Jetson Orin Nano belleğine göre (GB)
+    )
+    
+    # export işlemi sonrası oluşan .engine dosyasının adını bizim belirlediğimiz yola taşıyoruz.
+    # Ultralytics normalde modeli çalıştırıldığı dizine 'yolo12s.engine' olarak kaydeder.
+    default_engine_path = Path("./yolo12s.engine")
+    if default_engine_path.exists():
+        default_engine_path.rename(MODEL_PATH_ENGINE)
+        logging.info("✅ Model başarıyla TensorRT formatına dönüştürüldü → %s", MODEL_PATH_ENGINE.name)
+    else:
+        logging.error("❌ TensorRT motor dosyası oluşturulamadı! 'ultralytics' kütüphanesinin güncel olduğundan emin olun.")
+        sys.exit(1)
+
+    return YOLO(str(MODEL_PATH_ENGINE))
+    
+# ---------------------------------------------------------------------------
+def realtime_detection(model: YOLO, camera_index: int = CAMERA_INDEX) -> None:
+    """
+    USB kamerayı açar ve optimize edilmiş modelle gerçek-zamanlı meyve tespiti yapar.
+    """
+    with open(DATA_YAML, "r", encoding="utf-8") as f:
+        classes = yaml.safe_load(f)["names"]
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        logging.error("⚠️  Kamera açılamadı! (index=%d)", camera_index)
+        return
+
+    prev_time = time.time()
+    logging.info("🚀 Gerçek zamanlı tespit başlatıldı. Çıkmak için 'q' tuşuna basın.")
+    
+    # 'stream=True' bellek kullanımını optimize eder ve sürekli video akışları için daha verimlidir.
+    for r in model.stream(source=camera_index, stream=True, conf=0.25, iou=0.45):
+        frame = r.orig_img
+        detected = []
+        for box in r.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            if cls_id < len(classes):
+                label = f"{classes[cls_id]}: {conf:.2f}"
+                detected.append(classes[cls_id])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        for i, (fruit, cnt) in enumerate(Counter(detected).items()):
+            cv2.putText(frame, f"{fruit}: {cnt}", (10, 60 + i * 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        now = time.time()
+        fps = 1 / (now - prev_time + 1e-6)
+        prev_time = now
+        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        cv2.imshow("YOLOv12s Jetson - Real-Time Detection (press q to quit)", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+# ---------------------------------------------------------------------------
+def main() -> None:
+    # sanity_check() fonksiyonu etiket dosyalarını kontrol eder.
+    # Eğer özel bir veri setiniz yoksa ve sadece COCO sınıflarını kullanacaksanız
+    # bu adımı geçici olarak yorum satırı yapabilirsiniz.
+    # sanity_check()
+    model = load_and_optimize_yolo12()
+    # `realtime_detection` içindeki `model.stream` zaten kamerayı kullanıyor,
+    # bu yüzden ayrı bir fonksiyon çağırmaya gerek yok.
+    realtime_detection(model)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
