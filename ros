@@ -1,0 +1,167 @@
+import sys
+import os
+import yaml
+import time
+import logging
+from pathlib import Path
+from collections import Counter
+
+import cv2
+import torch
+from ultralytics import YOLO
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+# ---------- PATH SETTINGS ---------------------------------------------------
+# Jetson dosya sistemine göre güncelleyin (örneğin, /home/user/Fruits-detection)
+ROOT_DIR      = Path("/home/user/Fruits-detection")
+DATA_YAML     = ROOT_DIR / "data.yaml"
+MODEL_PATH    = ROOT_DIR / "yolo_fruit_detector.pt"
+SPLITS        = ("train", "valid", "test")
+IMG_EXT       = {".jpg", ".jpeg", ".png"}
+CAMERA_INDEX  = 0  # Jetson'ın varsayılan kamerası için genellikle 0
+
+# ---------------------------------------------------------------------------
+def sanity_check() -> None:
+    """
+    Veri setinde görüntü/etiket tutarlılığını kontrol eder ve önbellek dosyalarını temizler.
+    Eksik veya boş etiket varsa programdan çıkar.
+    """
+    ok = True
+    for split in SPLITS:
+        img_dir = ROOT_DIR / split / "images"
+        lbl_dir = ROOT_DIR / split / "labels"
+
+        if not img_dir.exists() or not lbl_dir.exists():
+            logging.error("Eksik görüntüler veya etiketler klasörü: %s!", split)
+            sys.exit(1)
+
+        imgs  = [p for p in img_dir.rglob("*") if p.suffix.lower() in IMG_EXT]
+        miss  = 0
+        empty = 0
+        for p in imgs:
+            rel   = p.relative_to(img_dir).with_suffix(".txt")
+            lbl_p = lbl_dir / rel
+            if not lbl_p.exists():
+                miss += 1
+            elif lbl_p.stat().st_size == 0:
+                empty += 1
+
+        logging.info("%s → %d görüntü | %d eksik etiket | %d boş etiket",
+                     split, len(imgs), miss, empty)
+        if miss or empty:
+            ok = False
+
+    # YOLO'nun veri setini yeniden taraması için önbellek dosyalarını temizle
+    for c in ROOT_DIR.rglob("*.cache"):
+        c.unlink(missing_ok=True)
+
+    if not ok:
+        logging.error("Eksik/boş etiket tespit edildi → veri setini düzeltin!")
+        sys.exit(1)
+
+# ---------------------------------------------------------------------------
+def train_or_load() -> YOLO:
+    """
+    Önceden eğitilmiş bir model varsa yükler; yoksa yeni bir model eğitir.
+    Jetson'da eğitim kaynak yoğun olabilir, önceden eğitilmiş model önerilir.
+    """
+    if MODEL_PATH.exists():
+        logging.info("Eğitilmiş model bulundu (%s), yükleniyor…", MODEL_PATH.name)
+        return YOLO(str(MODEL_PATH))
+
+    logging.warning("Model bulunamadı. Jetson'da eğitim yavaş olabilir.")
+    logging.info("Eğitim başlatılıyor…")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model  = YOLO("yolov8s.pt")  # YOLO12 varsa: YOLO("yolo12s.pt") kullanın
+
+    model.train(
+        data=str(DATA_YAML),
+        epochs=250,  # Eğitim süresini belirler, gerektiğinde ayarlayın
+        imgsz=640,   # Görüntü boyutu: Hız ve doğruluk dengesi için 640x640
+        batch=16,    # Batch boyutu: Jetson'ın belleği için 16 uygun
+        workers=8,   # Veri yükleme için 8 iş parçacığı, çok çekirdekli işlemeyi kullanır
+        device=device,
+        half=True,   # FP16: Daha hızlı hesaplama ve düşük bellek kullanımı için
+        name="fruit_detector",
+    )
+    model.save(str(MODEL_PATH))
+    logging.info("Model eğitildi ve kaydedildi → %s", MODEL_PATH.name)
+    return model
+
+# ---------------------------------------------------------------------------
+def realtime_detection(model: YOLO, camera_index: int = CAMERA_INDEX) -> None:
+    """
+    Jetson'da kamerayı açar ve gerçek zamanlı meyve algılama yapar.
+    """
+    # Sınıf isimlerini YAML dosyasından oku
+    with open(DATA_YAML, "r", encoding="utf-8") as f:
+        classes = yaml.safe_load(f)["names"]
+
+    # Jetson'ın donanımı için optimize edilmiş GStreamer ardışık düzeni
+    gst_pipeline = f"nvarguscamerasrc sensor-id={camera_index} ! video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
+    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        logging.error("Kamera açılamadı! (index=%d)", camera_index)
+        return
+
+    prev = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame_r = cv2.resize(frame, (640, 640))  # Model girdisi için 640x640'a yeniden boyutlandır
+        results = model(frame_r, 
+                        conf=0.25,   # Güven eşiği: Yanlış pozitifleri azaltır, hız için düşük tutulabilir
+                        iou=0.45,    # IoU eşiği: Örtüşme kontrolü, doğruluk ve hız dengesi için
+                        device="cuda")  # GPU kullanımı: Jetson'da maksimum performans için
+        detected = []
+
+        for r in results:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf[0])
+                cls  = int(b.cls[0])
+
+                if cls < len(classes):
+                    label = f"{classes[cls]}: {conf:.2f}"
+                    detected.append(classes[cls])
+
+                    # Orijinal çözünürlüğe geri ölçeklendirme
+                    h, w = frame.shape[:2]
+                    x1 = int(x1 * w / 640); y1 = int(y1 * h / 640)
+                    x2 = int(x2 * w / 640); y2 = int(y2 * h / 640)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Meyve sayısını ekranda göster
+        for i, (fruit, cnt) in enumerate(Counter(detected).items()):
+            cv2.putText(frame, f"{fruit}: {cnt}", (10, 60 + i*30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        # FPS hesapla ve göster
+        now = time.time()
+        fps = 1 / (now - prev + 1e-6)  # Küçük bir payda hatasını önlemek için 1e-6
+        prev = now
+        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        cv2.imshow("Gerçek Zamanlı Meyve Algılama (çıkmak için q'ya basın)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ---------------------------------------------------------------------------
+def main() -> None:
+    sanity_check()             # 1) Veri seti tutarlılığını kontrol et
+    model = train_or_load()    # 2) Modeli yükle veya eğit
+    realtime_detection(model)  # 3) Gerçek zamanlı algılamayı başlat
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
